@@ -126,6 +126,49 @@ Novel contribution: epistemic layer separation as a governance primitive, top-do
 
 -----
 
+## Demo Implementation
+
+A reference implementation is available in [`demo.py`](./demo.py) — a self-contained Python script with no external dependencies.
+
+### Run
+
+```bash
+python3 demo.py          # Appendix B walkthrough
+python3 demo.py -i       # Interactive mode
+python3 demo.py -di      # Walkthrough + interactive
+```
+
+### What is implemented
+
+| Layer | Implementation |
+|---|---|
+| **CAPTURE** | Parses `@META`, `@PATCH +/~/−/^`, inline markers `@F/@D/@R/@H/@S`, plain text |
+| **VALIDATE** | Tier A — seal locks, container hierarchy, slot collision; Tier B — semantic negation detection; Tier C — adversarial overlap check |
+| **SEAL** | `add`, `modify`, `deprecate`, `branch` with full patch log (ID, actor, decision) |
+| **RENDER** | State projection with `StateD` delta output per turn |
+
+### Example session
+
+```
+Turn 5  [main]
+Input: @F LLMs lose coherence because they have no explicit state.
+[CAPTURE]  container=F  op=add
+[VALIDATE] OK  — no conflict detected
+[SEAL]     Applied
+StateD: +F:llms_lose_coherence... (soft)
+
+Turn 6  [main]
+Input: @F Modern LLMs implicitly do have a stable state.
+[CAPTURE]  container=F  op=add
+[VALIDATE] BRANCH  — semantic tension with F:llms_lose_coherence...
+[SEAL]     Applied
+StateD: ^BRANCH Branch_1 ← conflict isolated
+```
+
+The contradictory fact is isolated in a branch rather than silently overwriting canon — the core invariant of the framework.
+
+---
+
 ## Status
 
 - [x] Formal specification (v1.0)
@@ -134,7 +177,7 @@ Novel contribution: epistemic layer separation as a governance primitive, top-do
 - [x] Chat mode with @META / @PATCH / inline markers
 - [x] Threat model and non-goals
 - [x] Annotated walkthrough (Appendix B)
-- [ ] Reference implementation (next step)
+- [x] Reference implementation (`demo.py`)
 
 -----
 
