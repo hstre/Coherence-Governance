@@ -8,6 +8,7 @@ Pipeline: CAPTURE → VALIDATE → SEAL → RENDER
 
 import re
 import sys
+import argparse
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
@@ -207,8 +208,18 @@ def _auto_key(text: str) -> str:
 
 # ─── Layer II: VALIDATE ───────────────────────────────────────────────────────
 
+@dataclass
+class ValidationResult:
+    decision:     Decision
+    tier:         str   # "A-seal" | "A-hierarchy" | "A-collision" | "B" | "C" | "ok"
+    evidence:     str   # "strong" | "weak" | "none"
+    conflict_key: str   # key of conflicting entry (or "")
+    conflict_val: str   # value of conflicting entry (or "")
+    reason:       str   # human-readable one-line explanation
+
+
 def validate(container: Container, key: str, value: str,
-             state: GovernanceState, op: str = "add") -> tuple:
+             state: GovernanceState, op: str = "add") -> ValidationResult:
     """
     Three-tier validation.
 
@@ -216,7 +227,7 @@ def validate(container: Container, key: str, value: str,
     Tier B  — Semantic conflict detection (keyword-based approximation)
     Tier C  — Adversarial check: does any existing entry negate this?
 
-    Returns (Decision, reason_str)
+    Returns ValidationResult
     """
     store = state.store(container)
 
@@ -226,19 +237,36 @@ def validate(container: Container, key: str, value: str,
         existing = store[key]
         if existing.seal in (SealLevel.HARD, SealLevel.MILESTONE):
             if existing.value != value:
-                return (Decision.PATCH_REQUIRED,
-                        f"'{key}' is {existing.seal}-sealed; changes require explicit patch")
+                return ValidationResult(
+                    decision=Decision.PATCH_REQUIRED,
+                    tier="A-seal",
+                    evidence="strong",
+                    conflict_key=key,
+                    conflict_val=existing.value,
+                    reason=f"'{key}' is {existing.seal}-sealed; changes require explicit patch")
 
     # A2: Container Hierarchy
     if container == Container.R:
         if key in store and store[key].value != value and op == "add":
-            return (Decision.STOP,
-                    f"Rule collision on '{key}': '{store[key].value}' ≠ '{value}'")
+            existing = store[key]
+            return ValidationResult(
+                decision=Decision.STOP,
+                tier="A-hierarchy",
+                evidence="strong",
+                conflict_key=key,
+                conflict_val=existing.value,
+                reason=f"Rule collision on '{key}': '{existing.value}' ≠ '{value}'")
 
     if container == Container.D:
         if key in store and store[key].value != value and op == "add":
-            return (Decision.STOP,
-                    f"Definition drift on '{key}' — use MODIFY patch")
+            existing = store[key]
+            return ValidationResult(
+                decision=Decision.STOP,
+                tier="A-hierarchy",
+                evidence="strong",
+                conflict_key=key,
+                conflict_val=existing.value,
+                reason=f"Definition drift on '{key}' — use MODIFY patch")
 
     # ── Tier A: Direct Slot Collision ─────────────────────────────────────
     if key in store and op == "add":
@@ -247,7 +275,10 @@ def validate(container: Container, key: str, value: str,
             evidence = "strong" if container in (Container.F, Container.D, Container.R) else "weak"
             impact   = "high"
             return _decision_from_table(evidence, impact, state,
-                                        f"direct key collision on '{key}'")
+                                        f"direct key collision on '{key}'",
+                                        tier="A-collision",
+                                        conflict_key=key,
+                                        conflict_val=existing.value)
 
     # ── Tier B: Semantic Similarity ────────────────────────────────────────
     result = _tier_b_semantic(container, key, value, store, state)
@@ -259,7 +290,13 @@ def validate(container: Container, key: str, value: str,
     if result:
         return result
 
-    return (Decision.OK, "no conflict detected")
+    return ValidationResult(
+        decision=Decision.OK,
+        tier="ok",
+        evidence="none",
+        conflict_key="",
+        conflict_val="",
+        reason="no conflict detected")
 
 
 # ── Negation heuristic words ──
@@ -291,8 +328,11 @@ def _tier_b_semantic(container, key, value, store, state):
                 impact = "high" if container == Container.F else "med"
                 return _decision_from_table(
                     "weak", impact, state,
-                    f"semantic tension with {container.value}:{k} "
-                    f"('{existing.value[:50]}')")
+                    f"semantic negation",
+                    tier="B",
+                    conflict_key=k,
+                    conflict_val=existing.value,
+                    shared_words=shared)
     return None
 
 def _tier_c_adversarial(container, key, value, store, state):
@@ -316,30 +356,48 @@ def _tier_c_adversarial(container, key, value, store, state):
             if v_neg != e_neg:
                 return _decision_from_table(
                     "strong", "high", state,
-                    f"[Tier C] counterexample found in {container.value}:{k}")
+                    f"counterexample found in {container.value}:{k}",
+                    tier="C",
+                    conflict_key=k,
+                    conflict_val=existing.value)
     return None
 
 
 def _decision_from_table(evidence: str, impact: str,
-                          state: GovernanceState, reason: str) -> tuple:
+                          state: GovernanceState, reason: str,
+                          tier: str = "B",
+                          conflict_key: str = "",
+                          conflict_val: str = "",
+                          shared_words: set = None) -> ValidationResult:
     """Decision tables B1–B3 from the spec."""
     mode = state.conflict
-    risk = state.risk
 
     if evidence == "strong":
         if mode == "branch":
-            return (Decision.BRANCH, reason)
-        return (Decision.STOP, reason)
+            decision = Decision.BRANCH
+        else:
+            decision = Decision.STOP
+        return ValidationResult(decision=decision, tier=tier, evidence=evidence,
+                                conflict_key=conflict_key, conflict_val=conflict_val,
+                                reason=reason)
 
     if evidence == "weak":
         if impact == "high":
             if mode == "branch":
-                return (Decision.BRANCH, reason)
-            return (Decision.REQUIRE_USER, reason)
+                decision = Decision.BRANCH
+            else:
+                decision = Decision.REQUIRE_USER
+            return ValidationResult(decision=decision, tier=tier, evidence=evidence,
+                                    conflict_key=conflict_key, conflict_val=conflict_val,
+                                    reason=reason)
         # med/low impact
-        return (Decision.FLAG, f"{reason} [tension noted]")
+        return ValidationResult(decision=Decision.FLAG, tier=tier, evidence=evidence,
+                                conflict_key=conflict_key, conflict_val=conflict_val,
+                                reason=f"{reason} [tension noted]")
 
-    return (Decision.FLAG, reason)
+    return ValidationResult(decision=Decision.FLAG, tier=tier, evidence=evidence,
+                            conflict_key=conflict_key, conflict_val=conflict_val,
+                            reason=reason)
 
 
 # ─── Layer III: SEAL ──────────────────────────────────────────────────────────
@@ -491,12 +549,43 @@ def process_turn(text: str, state: GovernanceState, turn_num: int) -> list:
             print(c(RED, " VALIDATE: STOP — M0 kernel is immutable"))
             return []
 
-        decision, reason = validate(container, key, value, state, op)
+        vr = validate(container, key, value, state, op)
+        decision = vr.decision
         dec_col = DECISION_COLOR.get(decision, RESET)
-        print(f" VALIDATE: {c(dec_col, decision.value)}  — {reason}")
+
+        # Tier label for display
+        tier_labels = {
+            "A-seal": "Tier A — sealed lock",
+            "A-hierarchy": "Tier A — container hierarchy",
+            "A-collision": "Tier A — direct slot collision",
+            "B": "Tier B — semantic negation",
+            "C": "Tier C — adversarial counterexample",
+            "ok": "no conflict",
+        }
+        tier_label = tier_labels.get(vr.tier, vr.tier)
+
+        print(f" [VALIDATE] {c(dec_col, decision.value)} — {tier_label}")
+        if vr.conflict_key:
+            print(f"   conflict:  {container.value}:{vr.conflict_key}")
+            print(f"              = \"{vr.conflict_val[:80]}\"")
+        if vr.tier == "B" and vr.conflict_key:
+            # compute shared words for display
+            v_words = _words(value)
+            e_words = _words(vr.conflict_val)
+            shared = v_words & e_words
+            if shared:
+                print(f"   shared:    {{{', '.join(sorted(shared))}}}")
+        impact_str = "high" if vr.tier in ("B", "C", "A-collision") else "n/a"
+        if vr.tier != "ok":
+            table_ref = {"BRANCH": "Table B3: BRANCH",
+                         "STOP": "Table B2: STOP",
+                         "FLAG": "Table B1: FLAG",
+                         "PATCH_REQUIRED": "Table A1: PATCH_REQUIRED",
+                         "REQUIRE_USER": "Table B2: REQUIRE_USER"}.get(decision.value, "")
+            print(f"   evidence:  {vr.evidence}  →  impact: {impact_str}  →  {table_ref}")
 
         applied, msg, delta = seal_apply(state, container, key, value,
-                                         op, decision, opts)
+                                         op, vr.decision, opts)
 
         if delta:
             print(c(GREEN, f" [SEAL]    Applied"))
@@ -525,52 +614,380 @@ def process_turn(text: str, state: GovernanceState, turn_num: int) -> list:
     return []
 
 
-# ─── Demo Scenario (Appendix B + extended) ───────────────────────────────────
+# ─── Scenarios ────────────────────────────────────────────────────────────────
 
-DEMO_SCENARIO = [
-    # Appendix B walkthrough
-    ("B.1 — Initialize governance",
-     "@META mode=analysis conflict=branch seal=manual risk=strict"),
+SCENARIOS = {
+    "silent_overwrite": (
+        "Silent Overwriting",
+        [
+            ("Initialize governance",
+             "@META mode=analysis conflict=branch seal=manual risk=strict"),
+            ("Hard-seal: no silent overwriting",
+             "@PATCH + R no_silent_overwrite = true | seal=hard"),
+            ("First fact: pipeline is sequential",
+             "@PATCH + F pipeline_order = sequential: each request processed one at a time | seal=soft"),
+            ("Contradictory update — same key, different value → triggers BRANCH (Tier A: slot collision)",
+             "@PATCH + F pipeline_order = parallel: all requests processed simultaneously"),
+            ("Seal all facts globally",
+             "@SEAL F scope=global"),
+        ]
+    ),
 
-    ("B.2 — Hard-seal: no silent overwriting",
-     "@PATCH + R no_silent_overwrite = true | seal=hard"),
+    "definition_drift": (
+        "Definition Drift",
+        [
+            ("Initialize governance",
+             "@META mode=analysis conflict=stop seal=manual risk=strict"),
+            ("Define coherence (first definition)",
+             "@PATCH + D coherence = consistent maintenance of claims across turns | seal=hard"),
+            ("Redefine coherence — triggers STOP (definition drift)",
+             "@PATCH + D coherence = stylistic uniformity in output formatting"),
+        ]
+    ),
 
-    ("       Add second hard rule",
-     "@PATCH + R sealed_requires_patch = true | seal=hard"),
+    "rule_violation": (
+        "Rule Violation",
+        [
+            ("Initialize governance",
+             "@META mode=analysis conflict=stop seal=manual risk=strict"),
+            ("Establish rule (soft seal): conflict_strategy = branch",
+             "@PATCH + R conflict_strategy = branch"),
+            ("Attempt rule collision on UNSEALED rule → STOP (Tier A2: container hierarchy)",
+             "@PATCH + R conflict_strategy = stop"),
+            ("Hard-seal the rule (same value, just sealing)",
+             "@PATCH ~ R conflict_strategy = branch | seal=hard"),
+            ("Attempt change on SEALED rule → PATCH_REQUIRED (Tier A1: sealed lock)",
+             "@PATCH ~ R conflict_strategy = prefer | seal=hard"),
+        ]
+    ),
 
-    ("B.3 — Define VALIDATE as Risk Controller",
-     "@PATCH + D VALIDATE = Risk Controller | seal=hard"),
+    "hypothesis_coexistence": (
+        "Hypothesis Coexistence",
+        [
+            ("Initialize governance",
+             "@META mode=analysis conflict=branch seal=manual risk=strict"),
+            ("Hypothesis 1: memory bottleneck",
+             "@H The primary bottleneck is insufficient memory capacity."),
+            ("Hypothesis 2: attention limitations — NOT branched (H can coexist)",
+             "@H The primary bottleneck is attention mechanism limitations, not memory."),
+            ("Hypothesis 3: both factors — coexists with contradictory hypotheses",
+             "@H Both memory and attention contribute equally to the bottleneck."),
+        ]
+    ),
 
-    ("B.3 — Introduce fact: LLMs lack explicit state",
-     "@F LLMs lose coherence because they have no explicit state."),
+    "appendix_b": (
+        "Appendix B Walkthrough",
+        [
+            ("B.1 — Initialize governance",
+             "@META mode=analysis conflict=branch seal=manual risk=strict"),
+            ("B.2 — Hard-seal: no silent overwriting",
+             "@PATCH + R no_silent_overwrite = true | seal=hard"),
+            ("       Add second hard rule",
+             "@PATCH + R sealed_requires_patch = true | seal=hard"),
+            ("B.3 — Define VALIDATE as Risk Controller",
+             "@PATCH + D VALIDATE = Risk Controller | seal=hard"),
+            ("B.3 — Introduce fact: LLMs lack explicit state",
+             "@F LLMs lose coherence because they have no explicit state."),
+            ("B.4 — Contradictory fact → should BRANCH",
+             "@F Modern LLMs implicitly do have a stable state."),
+            ("       Style preference",
+             "@S Use concise analytical language without passive constructions."),
+            ("       Hypothesis about solution",
+             "@H Explicit state management could reduce coherence failures by 40%."),
+            ("B.5 — Try to overwrite a hard-sealed rule → BLOCKED",
+             "@PATCH ~ R no_silent_overwrite = false | seal=none"),
+            ("B.6 — Seal all facts globally",
+             "@SEAL F scope=global"),
+            ("       Try to overwrite sealed fact → PATCH_REQUIRED",
+             "@PATCH ~ F llms_lose_coherence_because_they_have_no_explicit_state = "
+             "LLMs always maintain perfect coherence. | seal=hard"),
+            ("       Proper deprecate + replace",
+             "@PATCH - F llms_lose_coherence_because_they_have_no_explicit_state "
+             "| repl=llms_lack_persistent_state"),
+            ("       Plain text output (RENDER layer)",
+             "Given the established facts, coherence governance addresses the core "
+             "architectural gap in LLM conversation management."),
+        ]
+    ),
+}
 
-    ("B.4 — Contradictory fact → should BRANCH",
-     "@F Modern LLMs implicitly do have a stable state."),
 
-    ("       Style preference",
-     "@S Use concise analytical language without passive constructions."),
+# ─── Layer IV: RENDER ─────────────────────────────────────────────────────────
 
-    ("       Hypothesis about solution",
-     "@H Explicit state management could reduce coherence failures by 40%."),
+def render_state(state: GovernanceState) -> str:
+    """Project current validated state (RENDER layer)."""
+    lines = [c(BOLD, f"\n{'═'*62}")]
+    lines.append(c(BOLD, f"  Active State  [{state.current_branch}]  "
+                         f"mode={state.mode}  risk={state.risk}"))
+    lines.append(c(BOLD, f"{'═'*62}"))
 
-    ("B.5 — Try to overwrite a hard-sealed rule → BLOCKED",
-     "@PATCH ~ R no_silent_overwrite = false | seal=none"),
+    for cont in [Container.F, Container.D, Container.R,
+                 Container.H, Container.S, Container.M1]:
+        branch = state.current_branch
+        active = {k: v for k, v in state.containers[cont].get(branch, {}).items()
+                  if v.status != Status.DEPRECATED}
+        if not active:
+            continue
+        lines.append(c(BLUE, f"\n  [{cont.value}] {CONTAINER_NAMES[cont]}"))
+        for key, entry in active.items():
+            seal_tag = f" [{entry.seal.value}]" if entry.seal != SealLevel.SOFT else ""
+            status_tag = f" ({entry.status.value})" if entry.status == Status.PROPOSED else ""
+            lines.append(f"    {c(BOLD, key)} = \"{entry.value}\"{seal_tag}{status_tag}")
 
-    ("B.6 — Seal all facts globally",
-     "@SEAL F scope=global"),
+    if len(state.branches) > 1:
+        lines.append(c(CYAN, f"\n  Branches: {', '.join(state.branches)}"))
+        for b in state.branches[1:]:
+            lines.append(c(GRAY, f"    [{b}]: diverged state (conflict isolated)"))
 
-    ("       Try to overwrite sealed fact → PATCH_REQUIRED",
-     "@PATCH ~ F llms_lose_coherence_because_they_have_no_explicit_state = "
-     "LLMs always maintain perfect coherence. | seal=hard"),
+    lines.append(c(BOLD, f"{'═'*62}"))
+    return "\n".join(lines)
 
-    ("       Proper deprecate + replace",
-     "@PATCH - F llms_lose_coherence_because_they_have_no_explicit_state "
-     "| repl=llms_lack_persistent_state"),
 
-    ("       Plain text output (RENDER layer)",
-     "Given the established facts, coherence governance addresses the core "
-     "architectural gap in LLM conversation management."),
+def render_all_branches(state: GovernanceState) -> str:
+    """Show each branch separately, marking entries that differ from main."""
+    lines = []
+
+    # Collect all keys per container for main
+    def get_active(branch, cont):
+        return {k: v for k, v in state.containers[cont].get(branch, {}).items()
+                if v.status != Status.DEPRECATED}
+
+    for branch in state.branches:
+        is_active = branch == state.current_branch
+        active_tag = "[active]" if is_active else f"[diverged at {_branch_diverge_point(state, branch)}]"
+
+        lines.append(c(BOLD, f"\n{'═'*62}"))
+        lines.append(c(BOLD, f"  Branch: {branch:<30} {active_tag}"))
+        lines.append(c(BOLD, f"{'═'*62}"))
+
+        for cont in [Container.F, Container.D, Container.R,
+                     Container.H, Container.S, Container.M1]:
+            active = get_active(branch, cont)
+            if not active:
+                continue
+            lines.append(c(BLUE, f"\n  [{cont.value}] {CONTAINER_NAMES[cont]}"))
+            main_active = get_active("main", cont)
+            for key, entry in active.items():
+                seal_tag = f" [{entry.seal.value}]" if entry.seal != SealLevel.SOFT else ""
+                differs = ""
+                if branch != "main":
+                    main_entry = main_active.get(key)
+                    if main_entry is None or main_entry.value != entry.value:
+                        differs = c(CYAN, "  ← differs from main")
+                lines.append(f"    {c(BOLD, key)} = \"{entry.value}\"{seal_tag}{differs}")
+
+    return "\n".join(lines)
+
+
+def _branch_diverge_point(state: GovernanceState, branch: str) -> str:
+    """Find the key where a branch diverged from main."""
+    for cont in Container:
+        main_store = state.containers[cont].get("main", {})
+        branch_store = state.containers[cont].get(branch, {})
+        for key, entry in branch_store.items():
+            main_entry = main_store.get(key)
+            if main_entry is None or main_entry.value != entry.value:
+                return f"{cont.value}:{key}"
+    return "unknown"
+
+
+# ─── Before/After Comparison ──────────────────────────────────────────────────
+
+class NaiveChat:
+    def __init__(self): self.log = {}
+    def add(self, key, value): self.log[key] = value  # silently overwrites!
+
+
+def run_before_after():
+    print(c(BOLD, f"\n{'═'*62}"))
+    print(c(BOLD, "  BEFORE / AFTER: Naive vs. Governance"))
+    print(c(BOLD, f"{'═'*62}"))
+
+    sequence = [
+        ("architecture_layers", "The architecture has three layers.",
+         "statement_1: architecture has three layers"),
+        ("architecture_layers", "The architecture has four layers.",
+         "statement_2: architecture has FOUR layers  ← contradiction"),
+        ("pipeline_order",      "The pipeline order is CAPTURE first.",
+         "statement_3: pipeline order is CAPTURE first"),
+        ("pipeline_order",      "The pipeline order is RENDER first.",
+         "statement_4: pipeline order is RENDER first  ← contradiction"),
+    ]
+
+    # ── NAIVE MODE ────────────────────────────────────────────────────────
+    print(c(YELLOW, f"\n{'─'*62}"))
+    print(c(YELLOW, "  NAIVE MODE  (no governance — dict with silent overwrites)"))
+    print(c(YELLOW, f"{'─'*62}"))
+
+    naive = NaiveChat()
+    for key, value, desc in sequence:
+        print(c(GRAY, f"  + {desc}"))
+        naive.add(key, value)
+
+    print(c(RED, "\n  Final naive state (contradictions silently lost):"))
+    for k, v in naive.log.items():
+        print(f"    {c(BOLD, k)} = \"{v}\"")
+
+    # ── GOVERNANCE MODE ───────────────────────────────────────────────────
+    print(c(CYAN, f"\n{'─'*62}"))
+    print(c(CYAN, "  GOVERNANCE MODE  (GovernanceState — conflicts detected)"))
+    print(c(CYAN, f"{'─'*62}"))
+
+    gov = GovernanceState()
+    gov.conflict = "branch"
+    gov.risk = "strict"
+    turn_num = 1
+    for key, value, desc in sequence:
+        print(c(GRAY, f"\n  + {desc}"))
+        vr = validate(Container.F, key, value, gov, "add")
+        decision = vr.decision
+        dec_col = DECISION_COLOR.get(decision, RESET)
+        print(f"    VALIDATE: {c(dec_col, decision.value)}  — {vr.reason}")
+        opts = {}
+        seal_apply(gov, Container.F, key, value, "add", decision, opts)
+        turn_num += 1
+
+    print(c(GREEN, "\n  Final governance state:"))
+    for cont in [Container.F]:
+        for branch in gov.branches:
+            active = {k: v for k, v in gov.containers[cont].get(branch, {}).items()
+                      if v.status != Status.DEPRECATED}
+            if active:
+                tag = "[active]" if branch == gov.current_branch else "[branched]"
+                print(c(BLUE, f"    Branch: {branch}  {tag}"))
+                for k, entry in active.items():
+                    print(f"      {c(BOLD, k)} = \"{entry.value}\"")
+
+    print(c(GREEN, "\n  Contradictions preserved in branches, not silently overwritten."))
+    print(render_all_branches(gov))
+
+
+# ─── Test Suite ───────────────────────────────────────────────────────────────
+
+TEST_CASES = [
+    ("H with no existing entries → OK",
+     [],
+     (Container.H, "bottleneck", "memory capacity", "add"),
+     Decision.OK),
+
+    ("New R (no collision) → OK",
+     [],
+     (Container.R, "output_mode", "analytical", "add"),
+     Decision.OK),
+
+    ("R collision (same key, different value) → STOP",
+     [(Container.R, "output_mode", "analytical", "add")],
+     (Container.R, "output_mode", "creative", "add"),
+     Decision.STOP),
+
+    ("New F (no canon) → OK",
+     [],
+     (Container.F, "system_type", "stateless LLM", "add"),
+     Decision.OK),
+
+    ("F direct key collision → BRANCH",
+     [(Container.F, "system_type", "stateless LLM", "add")],
+     (Container.F, "system_type", "stateful system", "add"),
+     Decision.BRANCH),
+
+    ("Hard-sealed F modify → PATCH_REQUIRED",
+     [(Container.F, "fact_x", "original value", "add")],  # then hard-seal it
+     (Container.F, "fact_x", "new value", "modify"),
+     Decision.PATCH_REQUIRED),
+
+    ("Two contradictory F (semantic) → BRANCH",
+     [(Container.F, "coherence_f1", "LLMs have no persistent state and lose coherence over time.", "add")],
+     (Container.F, "coherence_f2", "LLMs maintain persistent state and preserve coherence over time.", "add"),
+     Decision.BRANCH),
+
+    ("Two contradictory H → OK (hypotheses coexist)",
+     [(Container.H, "hyp_1", "memory is the bottleneck not attention", "add")],
+     (Container.H, "hyp_2", "attention is the bottleneck not memory", "add"),
+     Decision.OK),
 ]
+
+
+def run_tests():
+    print(c(BOLD, f"\n{'═'*62}"))
+    print(c(BOLD, "  Test Suite"))
+    print(c(BOLD, f"{'═'*62}"))
+
+    passed = 0
+    failed = 0
+
+    for name, setup_ops, test_op, expected_decision in TEST_CASES:
+        state = GovernanceState()
+        state.conflict = "branch"
+        state.risk = "strict"
+
+        # Apply setup operations
+        for (cont, key, val, op) in setup_ops:
+            vr = validate(cont, key, val, state, op)
+            seal_apply(state, cont, key, val, op, vr.decision, {})
+
+        # Special case: hard-seal test
+        if name.startswith("Hard-sealed"):
+            # After setup, hard-seal the fact_x entry
+            store = state.store(Container.F)
+            if "fact_x" in store:
+                store["fact_x"].seal = SealLevel.HARD
+
+        # Run the test operation
+        t_cont, t_key, t_val, t_op = test_op
+        vr = validate(t_cont, t_key, t_val, state, t_op)
+        got = vr.decision
+
+        if got == expected_decision:
+            print(c(GREEN, f" [PASS] {name}"))
+            passed += 1
+        else:
+            print(c(RED,
+                    f" [FAIL] {name}"
+                    f"  expected={expected_decision.value}"
+                    f"  got={got.value}"))
+            failed += 1
+
+    print(c(BOLD, f"\n Tests: {passed} passed, {failed} failed"))
+    return failed == 0
+
+
+# ─── Scenario Runner ──────────────────────────────────────────────────────────
+
+def run_scenario(name: str):
+    if name not in SCENARIOS:
+        print(c(RED, f" Unknown scenario '{name}'. Available: {', '.join(SCENARIOS)}"))
+        return
+
+    title, steps = SCENARIOS[name]
+    state = GovernanceState()
+
+    print(c(BOLD, f"\n{'═'*62}"))
+    print(c(BOLD, f"  SCENARIO: {title}"))
+    print(c(BOLD, f"{'═'*62}"))
+
+    for turn_num, (description, command) in enumerate(steps, 1):
+        print(c(GRAY, f"\n ▸ {description}"))
+        process_turn(command, state, turn_num)
+
+    print(render_state(state))
+
+    if len(state.branches) > 1:
+        print(render_all_branches(state))
+
+    # Special post-run note for hypothesis_coexistence
+    if name == "hypothesis_coexistence":
+        print(c(GREEN, "\n  Note: all three H entries coexist — none were branched or blocked."))
+        h_store = state.containers[Container.H].get("main", {})
+        print(c(GREEN, f"  H entries in main branch: {len(h_store)}"))
+        for k, e in h_store.items():
+            if e.status != Status.DEPRECATED:
+                print(c(GREEN, f"    {k}: \"{e.value}\""))
+
+
+def run_all_scenarios():
+    for name in SCENARIOS:
+        run_scenario(name)
+        print()
 
 
 # ─── Entry Points ─────────────────────────────────────────────────────────────
@@ -587,22 +1004,6 @@ def print_banner():
 ╚══════════════════════════════════════════════════════════════╝"""))
 
 
-def run_demo(state: GovernanceState):
-    print(c(CYAN, "\n Running Appendix B walkthrough + extended scenarios\n"))
-    for turn_num, (description, command) in enumerate(DEMO_SCENARIO, 1):
-        print(c(GRAY, f" ▸ {description}"))
-        process_turn(command, state, turn_num)
-
-    print(render_state(state))
-
-    print(c(BOLD, f"\n{'─'*62}"))
-    print(c(BOLD, f" Patch Log  ({len(state.patches)} recorded)"))
-    for p in state.patches:
-        col = DECISION_COLOR.get(p.decision, RESET)
-        print(f"   {c(GRAY, p.id)}  {p.op:10s}  "
-              f"{p.container.value}:{p.key[:35]:<35}  {c(col, p.decision.value)}")
-
-
 def run_interactive(state: GovernanceState):
     print(c(BOLD, "\n── Interactive Mode ─────────────────────────────────────────"))
     print(c(GRAY, " Supported commands:"))
@@ -611,6 +1012,7 @@ def run_interactive(state: GovernanceState):
     print(c(GRAY, "   @F/@D/@R/@H/@S <statement>  (inline markers)"))
     print(c(GRAY, "   @SEAL F,D,R scope=global"))
     print(c(GRAY, "   state   — show current state"))
+    print(c(GRAY, "   branches — show all branches"))
     print(c(GRAY, "   quit    — exit\n"))
 
     turn_num = 100
@@ -627,24 +1029,52 @@ def run_interactive(state: GovernanceState):
         if text.lower() in ("state", "show"):
             print(render_state(state))
             continue
+        if text.lower() in ("branches", "branch"):
+            print(render_all_branches(state))
+            continue
         turn_num += 1
         process_turn(text, state, turn_num)
 
 
 def main():
-    state = GovernanceState()
     print_banner()
 
-    args = sys.argv[1:]
-    if "-i" in args or "--interactive" in args:
+    parser = argparse.ArgumentParser(
+        description="Coherence Governance Demo",
+        add_help=True)
+    parser.add_argument("--scenario", metavar="NAME",
+                        help="Run one scenario: "
+                             "silent_overwrite, definition_drift, rule_violation, "
+                             "hypothesis_coexistence, appendix_b")
+    parser.add_argument("--before-after", action="store_true",
+                        help="Run before/after comparison")
+    parser.add_argument("--test", action="store_true",
+                        help="Run test suite")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="Interactive mode")
+    parser.add_argument("-di", "--demo-interactive", action="store_true",
+                        help="All scenarios + interactive mode")
+
+    args = parser.parse_args()
+
+    if args.test:
+        run_tests()
+    elif args.before_after:
+        run_before_after()
+    elif args.scenario:
+        run_scenario(args.scenario)
+    elif args.interactive:
+        state = GovernanceState()
         run_interactive(state)
-    elif "-di" in args or "--demo-interactive" in args:
-        run_demo(state)
+    elif args.demo_interactive:
+        run_all_scenarios()
+        state = GovernanceState()
         run_interactive(state)
     else:
-        run_demo(state)
-        print(c(GRAY, "\n Run with -i for interactive mode, "
-                       "-di for demo + interactive mode"))
+        # Default: run all scenarios
+        run_all_scenarios()
+        print(c(GRAY, "\n Run with --help for options: "
+                      "--scenario NAME, --before-after, --test, -i, -di"))
 
 
 if __name__ == "__main__":
